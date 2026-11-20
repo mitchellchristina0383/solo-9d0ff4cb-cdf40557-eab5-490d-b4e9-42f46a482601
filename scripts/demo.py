@@ -62,11 +62,36 @@ def main() -> int:
         print(f"  作业 #{job['id']} 《{title}》 {pages} 页 / {job['total_sheets']} 张")
         return job["id"]
 
-    def sheet(job_id, no, sides=("front", "back")):
-        _, job = post(f"/api/jobs/{job_id}/print", {"side": "front", "sheet_no": no})
-        for side in sides[1:]:
-            _, job = post(f"/api/jobs/{job_id}/print", {"side": side, "sheet_no": no})
+    def get_job(job_id):
+        return call(base, "GET", f"/api/jobs/{job_id}")[1]
+
+    def current_attempt(job_id):
+        return next(r for r in get_job(job_id)["records"] if r["status"] == "in_progress")
+
+    def segment(job_id, status):
+        return next(s for s in get_job(job_id)["segments"] if s["status"] == status)
+
+    def print_side(job_id, side):
+        att = current_attempt(job_id)
+        return post(f"/api/jobs/{job_id}/print", {"side": side, "attempt_id": att["id"]})
+
+    def sheet(job_id, no):
+        _, job = print_side(job_id, "front")
+        if job["status"] == "printing" and job["current_sheet"] == no:
+            _, job = print_side(job_id, "back")
         return job
+
+    def jam(job_id):
+        seg = segment(job_id, "active")
+        att = current_attempt(job_id)
+        return post(
+            f"/api/jobs/{job_id}/jam",
+            {"segment_id": seg["id"], "attempt_id": att["id"]},
+        )
+
+    def stop(job_id):
+        seg = segment(job_id, "jammed")
+        return post(f"/api/jobs/{job_id}/stop", {"segment_id": seg["id"]})
 
     try:
         show("试跑一：半张卡纸 → 停稳 → 换机续印（6 页 / 3 张）")
@@ -75,11 +100,11 @@ def main() -> int:
         print("  一号机完整出第 1 张")
         sheet(job_id, 1)
         print("  第 2 张只出了正面，报告卡纸")
-        post(f"/api/jobs/{job_id}/print", {"side": "front", "sheet_no": 2})
-        post(f"/api/jobs/{job_id}/jam")
+        print_side(job_id, "front")
+        jam(job_id)
         code, _ = post(f"/api/jobs/{job_id}/switch", {})
         print(f"  停稳前尝试换机 -> {code}（应被拒绝）")
-        post(f"/api/jobs/{job_id}/stop")
+        stop(job_id)
         print("  原机已确认停稳，派续单到二号机")
         post(f"/api/jobs/{job_id}/switch", {})
         _, job = post(f"/api/jobs/{job_id}/switch", {})
@@ -87,7 +112,7 @@ def main() -> int:
         print(f"  续单数量 = {len(conts)}（重复换机不重复派单），从第 {conts[0]['start_sheet']} 张起")
         sheet(job_id, 2)
         sheet(job_id, 3)
-        _, job = call(base, "GET", f"/api/jobs/{job_id}")
+        job = get_job(job_id)
         print(f"  作业状态 {job['status']}，完整出纸 {job['printed_sheets']}/{job['total_sheets']} 张")
 
         show("试跑二：停稳前完整出纸都算数（8 页 / 4 张）")
@@ -96,15 +121,15 @@ def main() -> int:
         sheet(job2, 1)
         sheet(job2, 2)
         print("  第 1、2 张已完整出纸")
-        post(f"/api/jobs/{job2}/print", {"side": "front", "sheet_no": 3})
-        post(f"/api/jobs/{job2}/jam")
-        post(f"/api/jobs/{job2}/stop")
+        print_side(job2, "front")
+        jam(job2)
+        stop(job2)
         post(f"/api/jobs/{job2}/switch", {})
-        _, job = call(base, "GET", f"/api/jobs/{job2}")
+        job = get_job(job2)
         print(f"  停稳后仍保留完整出纸 {job['printed_sheets']} 张，从第 {job['current_sheet']} 张续印")
         sheet(job2, 3)
         sheet(job2, 4)
-        _, job = call(base, "GET", f"/api/jobs/{job2}")
+        job = get_job(job2)
         print(f"  作业状态 {job['status']}，完整出纸 {job['printed_sheets']}/{job['total_sheets']} 张")
 
         show("出纸记录（网页“出纸记录”表同源）")

@@ -79,20 +79,6 @@ class BaseCase(unittest.TestCase):
         self.assertEqual(code, 200, job)
         return job
 
-    def print_side(self, job_id: int, side: str, sheet_no=None):
-        payload = {"side": side}
-        if sheet_no is not None:
-            payload["sheet_no"] = sheet_no
-        return self.srv.post(f"/api/jobs/{job_id}/print", payload)
-
-    def print_sheet(self, job_id: int, sheet_no: int) -> dict:
-        code, job = self.print_side(job_id, "front", sheet_no)
-        self.assertEqual(code, 200, job)
-        if job["status"] == "printing" and job["current_sheet"] == sheet_no and sheet_no * 2 <= job["page_count"]:
-            code, job = self.print_side(job_id, "back", sheet_no)
-            self.assertEqual(code, 200, job)
-        return job
-
     def state(self) -> dict:
         code, data = self.srv.get("/api/state")
         self.assertEqual(code, 200, data)
@@ -103,6 +89,61 @@ class BaseCase(unittest.TestCase):
 
     def job(self, job_id: int) -> dict:
         return next(j for j in self.state()["jobs"] if j["id"] == job_id)
+
+    def current_attempt(self, job_id: int) -> dict:
+        att = next(
+            (r for r in self.job(job_id)["records"] if r["status"] == "in_progress"),
+            None,
+        )
+        self.assertIsNotNone(att, "当前应有正在出纸的记录")
+        return att
+
+    def segment(self, job_id: int, status: str) -> dict:
+        seg = next(
+            (s for s in self.job(job_id)["segments"] if s["status"] == status),
+            None,
+        )
+        self.assertIsNotNone(seg, f"应有状态为 {status} 的打印段")
+        return seg
+
+    def print_side(self, job_id: int, side: str, attempt_id: int):
+        return self.srv.post(
+            f"/api/jobs/{job_id}/print", {"side": side, "attempt_id": attempt_id}
+        )
+
+    def print_current(self, job_id: int, side: str):
+        return self.print_side(job_id, side, self.current_attempt(job_id)["id"])
+
+    def print_sheet(self, job_id: int, sheet_no: int) -> dict:
+        code, job = self.print_current(job_id, "front")
+        self.assertEqual(code, 200, job)
+        if (
+            job["status"] == "printing"
+            and job["current_sheet"] == sheet_no
+            and sheet_no * 2 <= job["page_count"]
+        ):
+            code, job = self.print_current(job_id, "back")
+            self.assertEqual(code, 200, job)
+        return job
+
+    def report_jam(self, job_id: int, segment_id=None, attempt_id=None):
+        if segment_id is None:
+            segment_id = self.segment(job_id, "active")["id"]
+        if attempt_id is None:
+            attempt_id = self.current_attempt(job_id)["id"]
+        return self.srv.post(
+            f"/api/jobs/{job_id}/jam",
+            {"segment_id": segment_id, "attempt_id": attempt_id},
+        )
+
+    def confirm_stop(self, job_id: int, segment_id=None):
+        if segment_id is None:
+            segment_id = self.segment(job_id, "jammed")["id"]
+        return self.srv.post(f"/api/jobs/{job_id}/stop", {"segment_id": segment_id})
+
+    def switch(self, job_id: int, printer_id=None):
+        body = {"printer_id": printer_id} if printer_id else {}
+        return self.srv.post(f"/api/jobs/{job_id}/switch", body)
 
 
 class DocumentTests(BaseCase):
@@ -165,7 +206,7 @@ class NormalPrintTests(BaseCase):
         self.assertEqual(job["printed_sheets"], 1)
 
         # 末张只有正面：出正面后整张完成，背面留白不能单独出
-        code, job = self.print_side(job_id, "front", 2)
+        code, job = self.print_current(job_id, "front")
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["printed_sheets"], 2)
@@ -181,37 +222,44 @@ class NormalPrintTests(BaseCase):
         job_id = self.finalize(self.make_doc("单页", 1))["id"]
         job = self.start(job_id, "P1")
         self.assertEqual(job["total_sheets"], 1)
-        code, job = self.print_side(job_id, "front", 1)
+        code, job = self.print_current(job_id, "front")
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "completed")
 
     def test_back_before_front_rejected(self):
         job_id = self.finalize(self.make_doc("双面", 4))["id"]
         self.start(job_id, "P1")
-        code, body = self.print_side(job_id, "back", 1)
+        code, body = self.print_current(job_id, "back")
         self.assertEqual(code, 409, body)
 
     def test_double_front_rejected(self):
         job_id = self.finalize(self.make_doc("双面", 4))["id"]
         self.start(job_id, "P1")
-        code, _ = self.print_side(job_id, "front", 1)
+        att = self.current_attempt(job_id)
+        code, _ = self.print_side(job_id, "front", att["id"])
         self.assertEqual(code, 200)
-        code, body = self.print_side(job_id, "front", 1)
+        code, body = self.print_side(job_id, "front", att["id"])
         self.assertEqual(code, 409, body)
 
-    def test_sheet_mismatch_rejected(self):
+    def test_stale_attempt_rejected(self):
+        """已完整出纸的那次出纸，再点一律按过期拒绝。"""
         job_id = self.finalize(self.make_doc("双面", 4))["id"]
         self.start(job_id, "P1")
-        code, body = self.print_side(job_id, "front", 2)
+        first = self.current_attempt(job_id)
+        job = self.print_sheet(job_id, 1)
+        self.assertEqual(job["printed_sheets"], 1)
+        code, body = self.print_side(job_id, "front", first["id"])
         self.assertEqual(code, 409, body)
-        self.assertEqual(body["code"], "sheet_mismatch")
+        self.assertEqual(body["code"], "stale")
 
     def test_blank_back_rejected(self):
         job_id = self.finalize(self.make_doc("奇数页", 3))["id"]
         self.start(job_id, "P1")
         self.print_sheet(job_id, 1)
-        self.print_side(job_id, "front", 2)
-        code, body = self.print_side(job_id, "back", 2)
+        last = self.current_attempt(job_id)
+        code, _ = self.print_side(job_id, "front", last["id"])
+        self.assertEqual(code, 200)
+        code, body = self.print_side(job_id, "back", last["id"])
         self.assertEqual(code, 409, body)
 
 
@@ -225,9 +273,9 @@ class JamTests(BaseCase):
         self.print_sheet(job_id, 1)
 
         # 第 2 张只出了正面就卡纸
-        code, job = self.print_side(job_id, "front", 2)
+        code, job = self.print_current(job_id, "front")
         self.assertEqual(code, 200, job)
-        code, job = self.srv.post(f"/api/jobs/{job_id}/jam")
+        code, job = self.report_jam(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "jammed")
         self.assertEqual(job["printed_sheets"], 1)
@@ -235,7 +283,7 @@ class JamTests(BaseCase):
         self.assertEqual(len(job["segments"]), 1, "停稳前不得派续单")
 
         # 停稳前不能换机
-        code, body = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, body = self.switch(job_id)
         self.assertEqual(code, 409, body)
         self.assertEqual(body["code"], "not_stopped")
 
@@ -247,12 +295,12 @@ class JamTests(BaseCase):
         self.assertFalse(scrapped[0]["back_printed"])
 
         # 确认停稳 → 换机
-        code, job = self.srv.post(f"/api/jobs/{job_id}/stop")
+        code, job = self.confirm_stop(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "stopped")
         self.assertEqual(job["printed_sheets"], 1)
 
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "printing")
         self.assertEqual(job["current_sheet"], 2)
@@ -263,12 +311,12 @@ class JamTests(BaseCase):
         self.assertEqual(cont[0]["start_sheet"], 2)
 
         # 重复换机只保留一份续单
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(len([s for s in job["segments"] if s["kind"] == "continuation"]), 1)
 
         # 备机从第 2 张起重印两面
-        code, body = self.print_side(job_id, "back", 2)
+        code, body = self.print_current(job_id, "back")
         self.assertEqual(code, 409, f"续单必须先重印正面: {body}")
         job = self.print_sheet(job_id, 2)
         self.assertEqual(job["printed_sheets"], 2)
@@ -293,18 +341,22 @@ class JamTests(BaseCase):
             self.print_sheet(job_id, sheet)
 
         # 第 3 张正面卡纸，第 4 张不可能出
-        self.print_side(job_id, "front", 3)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
+        jammed_attempt = self.current_attempt(job_id)
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
 
-        # 停稳前再尝试出纸一律拒绝，已出纸保持
-        code, body = self.print_side(job_id, "front", 3)
+        # 停稳前再尝试出纸一律拒绝（过期），已出纸保持
+        code, body = self.print_side(job_id, "front", jammed_attempt["id"])
         self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
         job = self.job(job_id)
         self.assertEqual(job["printed_sheets"], 2)
         self.assertEqual(job["next_sheet"], 3)
 
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["printed_sheets"], 2, "停稳前完整出纸的两张必须保留")
         self.assertEqual(job["current_sheet"], 3)
@@ -317,11 +369,13 @@ class JamTests(BaseCase):
     def test_jam_at_first_sheet_has_no_printed_sheets(self):
         job_id = self.finalize(self.make_doc("首张卡纸", 5))["id"]
         self.start(job_id, "P1")
-        self.print_side(job_id, "front", 1)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
         self.assertEqual(self.job(job_id)["printed_sheets"], 0)
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["current_sheet"], 1)
         job = self.print_sheet(job_id, 1)
@@ -332,7 +386,7 @@ class JamTests(BaseCase):
 
     def test_switch_before_start_rejected(self):
         job_id = self.finalize(self.make_doc("未开始", 2))["id"]
-        code, body = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, body = self.switch(job_id)
         self.assertEqual(code, 409, body)
 
     def test_jam_twice_and_switch_twice(self):
@@ -340,16 +394,21 @@ class JamTests(BaseCase):
         job_id = self.finalize(self.make_doc("两次换机", 8))["id"]
         self.start(job_id, "P1")
         self.print_sheet(job_id, 1)
-        self.print_side(job_id, "front", 2)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, _ = self.switch(job_id)
+        self.assertEqual(code, 200)
 
         # 备机第 2 张正面后再次卡纸
-        self.print_side(job_id, "front", 2)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         conts = [s for s in job["segments"] if s["kind"] == "continuation"]
         self.assertEqual(len(conts), 2)
@@ -368,15 +427,216 @@ class JamTests(BaseCase):
         job2 = self.finalize(self.make_doc("作业二", 4))["id"]
         self.start(job1, "P1")
         self.start(job2, "P2")
-        self.print_side(job1, "front", 1)
-        self.srv.post(f"/api/jobs/{job1}/jam")
-        self.srv.post(f"/api/jobs/{job1}/stop")
+        self.print_current(job1, "front")
+        code, _ = self.report_jam(job1)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job1)
+        self.assertEqual(code, 200)
 
-        code, body = self.srv.post(f"/api/jobs/{job1}/switch", {"printer_id": "P1"})
+        code, body = self.switch(job1, "P1")
         self.assertEqual(code, 400, body)
-        code, body = self.srv.post(f"/api/jobs/{job1}/switch", {"printer_id": "P2"})
+        code, body = self.switch(job1, "P2")
         self.assertEqual(code, 409, body)
         self.assertEqual(body["code"], "printer_busy")
+
+
+class StalePageTests(BaseCase):
+    """过期页面：出纸、报卡、停稳只能落在页面显示的那一次上。"""
+
+    def two_switch_setup(self):
+        """一号机卡纸换二号机、再卡换回一号机，回到一号机重印同一张纸。
+
+        返回 (job_id, (首段, 首次出纸), (次段, 二次出纸), 当前出纸)。
+        """
+        job_id = self.finalize(self.make_doc("换机两次", 4))["id"]
+        self.start(job_id, "P1")
+        first = (self.segment(job_id, "active"), self.current_attempt(job_id))
+        second = None
+        for i in range(2):
+            code, _ = self.report_jam(job_id)
+            self.assertEqual(code, 200)
+            code, _ = self.confirm_stop(job_id)
+            self.assertEqual(code, 200)
+            code, _ = self.switch(job_id)
+            self.assertEqual(code, 200)
+            if i == 0:
+                second = (self.segment(job_id, "active"), self.current_attempt(job_id))
+        current = self.current_attempt(job_id)
+        self.assertEqual(self.printer("P1")["state"], "printing")
+        return job_id, first, second, current
+
+    def test_stale_front_click_does_not_mark_new_sheet(self):
+        """换机两次回到一号机：最初页面的「出正面」不得记到新纸上。"""
+        job_id, (_, att1), _, current = self.two_switch_setup()
+        self.assertEqual(att1["sheet_no"], current["sheet_no"], "重印的是同一张纸")
+        self.assertNotEqual(att1["id"], current["id"])
+
+        code, body = self.print_side(job_id, "front", att1["id"])
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+
+        # 出纸记录、作业进度、机台占用保持原状
+        job = self.job(job_id)
+        self.assertEqual(job["printed_sheets"], 0)
+        self.assertEqual(job["status"], "printing")
+        rec = next(r for r in job["records"] if r["id"] == current["id"])
+        self.assertFalse(rec["front_printed"])
+        self.assertEqual(rec["status"], "in_progress")
+        p1 = self.printer("P1")
+        self.assertEqual(p1["state"], "printing")
+        self.assertEqual(p1["attempt"]["id"], current["id"])
+
+        # 刷新到当前这次出纸后可以正常出
+        code, job = self.print_side(job_id, "front", current["id"])
+        self.assertEqual(code, 200, job)
+        rec = next(r for r in job["records"] if r["id"] == current["id"])
+        self.assertTrue(rec["front_printed"])
+
+    def test_stale_back_click_rejected(self):
+        """二号机那次的旧页面点「出背面」，不得落到一号机新纸上。"""
+        job_id, _, (_, att2), current = self.two_switch_setup()
+        code, _ = self.print_side(job_id, "front", current["id"])
+        self.assertEqual(code, 200)
+        code, body = self.print_side(job_id, "back", att2["id"])
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+        rec = next(r for r in self.job(job_id)["records"] if r["id"] == current["id"])
+        self.assertFalse(rec["back_printed"])
+
+    def test_stale_jam_report_keeps_state(self):
+        """旧页面的「报告卡纸」不得作废当前出纸、不得改变机台占用。"""
+        job_id, (seg1, att1), _, current = self.two_switch_setup()
+        code, body = self.srv.post(
+            f"/api/jobs/{job_id}/jam",
+            {"segment_id": seg1["id"], "attempt_id": att1["id"]},
+        )
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+
+        job = self.job(job_id)
+        self.assertEqual(job["status"], "printing")
+        self.assertEqual(job["printed_sheets"], 0)
+        rec = next(r for r in job["records"] if r["id"] == current["id"])
+        self.assertEqual(rec["status"], "in_progress")
+        self.assertEqual(self.printer("P1")["state"], "printing", "机台占用保持原状")
+
+    def test_stale_stop_after_switch_rejected(self):
+        """已换机的那次卡纸，再确认停稳按过期拒绝。"""
+        job_id, (seg1, _), _, _ = self.two_switch_setup()
+        code, body = self.confirm_stop(job_id, seg1["id"])
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+
+    def test_confirm_stop_idempotent_until_switch(self):
+        """确认后还没换机，重复确认同一次卡纸仍可成功。"""
+        job_id = self.finalize(self.make_doc("重复确认", 4))["id"]
+        self.start(job_id, "P1")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
+        seg = self.segment(job_id, "jammed")
+
+        code, _ = self.confirm_stop(job_id, seg["id"])
+        self.assertEqual(code, 200)
+        code, job = self.confirm_stop(job_id, seg["id"])
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["status"], "stopped")
+        self.assertEqual(len(job["segments"]), 1)
+
+        code, _ = self.switch(job_id)
+        self.assertEqual(code, 200)
+        code, body = self.confirm_stop(job_id, seg["id"])
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+
+    def test_jam_report_idempotent_same_segment(self):
+        """同一次卡纸重复报告：第二次幂等返回，不重复作废。"""
+        job_id = self.finalize(self.make_doc("重复报卡", 4))["id"]
+        self.start(job_id, "P1")
+        seg = self.segment(job_id, "active")
+        att = self.current_attempt(job_id)
+        code, _ = self.report_jam(job_id, seg["id"], att["id"])
+        self.assertEqual(code, 200)
+        code, job = self.report_jam(job_id, seg["id"], att["id"])
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["status"], "jammed")
+        self.assertEqual(len([r for r in job["records"] if r["status"] == "scrapped"]), 1)
+
+    def test_other_printer_activity_does_not_block_buttons(self):
+        """另一台机的无关操作不影响本机按钮。"""
+        job1 = self.finalize(self.make_doc("本机作业", 4))["id"]
+        job2 = self.finalize(self.make_doc("邻机作业", 4))["id"]
+        self.start(job1, "P1")
+        self.start(job2, "P2")
+        att1 = self.current_attempt(job1)
+
+        # 二号机一连串无关操作：出纸、卡纸、停稳
+        self.print_sheet(job2, 1)
+        code, _ = self.report_jam(job2)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job2)
+        self.assertEqual(code, 200)
+
+        # 本机按之前看到的那次出纸提交，照常可用
+        code, job = self.print_side(job1, "front", att1["id"])
+        self.assertEqual(code, 200, job)
+        code, job = self.print_side(job1, "back", att1["id"])
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["printed_sheets"], 1)
+
+    def test_missing_target_rejected(self):
+        """缺少操作对象的请求直接拒绝，状态不变。"""
+        job_id = self.finalize(self.make_doc("缺少目标", 4))["id"]
+        self.start(job_id, "P1")
+        code, body = self.srv.post(f"/api/jobs/{job_id}/print", {"side": "front"})
+        self.assertEqual(code, 400, body)
+        code, body = self.srv.post(f"/api/jobs/{job_id}/jam", {})
+        self.assertEqual(code, 400, body)
+        code, body = self.srv.post(f"/api/jobs/{job_id}/stop", {})
+        self.assertEqual(code, 400, body)
+        self.assertEqual(self.job(job_id)["status"], "printing")
+        self.assertEqual(self.printer("P1")["state"], "printing")
+
+    def test_two_pages_interleaved(self):
+        """两个页面交错试跑出纸、报卡、停稳：各按自己看到的那次提交。"""
+        job_id = self.finalize(self.make_doc("双页面", 4))["id"]
+        self.start(job_id, "P1")
+        # 页面 A、页面 B 同时打开，看到同一次出纸
+        page_a_attempt = self.current_attempt(job_id)["id"]
+        page_b_attempt = self.current_attempt(job_id)["id"]
+
+        # A 出正面；B 用同一次出纸出背面（那次出纸仍在进行，有效）
+        code, _ = self.print_side(job_id, "front", page_a_attempt)
+        self.assertEqual(code, 200)
+        code, job = self.print_side(job_id, "back", page_b_attempt)
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["printed_sheets"], 1)
+
+        # B 的页面还停在第 1 张：再点出正面 → 过期拒绝
+        code, body = self.print_side(job_id, "front", page_b_attempt)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+
+        # A 报卡；B 重复报同一次卡（幂等）；A 确认停稳；B 未换机再确认（成功）
+        seg = self.segment(job_id, "active")["id"]
+        att = self.current_attempt(job_id)["id"]
+        code, _ = self.report_jam(job_id, seg, att)
+        self.assertEqual(code, 200)
+        code, _ = self.report_jam(job_id, seg, att)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id, seg)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id, seg)
+        self.assertEqual(code, 200)
+
+        # 换机后 B 的过期出纸点击仍被拒绝；A 刷新后正常续印到完成
+        code, _ = self.switch(job_id)
+        self.assertEqual(code, 200)
+        code, body = self.print_side(job_id, "front", att)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "stale")
+        job = self.print_sheet(job_id, 2)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["printed_sheets"], 2)
 
 
 class EdgeCaseTests(BaseCase):
@@ -387,15 +647,17 @@ class EdgeCaseTests(BaseCase):
         self.print_sheet(job_id, 1)
         self.print_sheet(job_id, 2)
         # 末张尚未完整出纸时卡住，半张作废，整张需重印
-        self.srv.post(f"/api/jobs/{job_id}/jam")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
         job = self.job(job_id)
         self.assertEqual(job["printed_sheets"], 2)
         self.assertEqual(job["status"], "jammed")
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["current_sheet"], 3)
-        code, job = self.print_side(job_id, "front", 3)
+        code, job = self.print_current(job_id, "front")
         self.assertEqual(code, 200, job)
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["printed_sheets"], 3)
@@ -406,11 +668,14 @@ class EdgeCaseTests(BaseCase):
     def test_printing_blocked_on_both_printers_after_jam(self):
         job_id = self.finalize(self.make_doc("停稳前禁印", 6))["id"]
         self.start(job_id, "P1")
-        self.print_side(job_id, "front", 1)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
+        jammed_attempt = self.current_attempt(job_id)
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
         for side in ("front", "back"):
-            code, body = self.print_side(job_id, side, 1)
+            code, body = self.print_side(job_id, side, jammed_attempt["id"])
             self.assertEqual(code, 409, body)
+            self.assertEqual(body["code"], "stale")
 
     def test_collation_order_matches_original_pages(self):
         """出纸记录按张号给出正/背面页码，装订顺序即原页序。"""
@@ -428,10 +693,12 @@ class RestartTests(BaseCase):
         job_id = self.finalize(self.make_doc("重启续印", 6))["id"]
         self.start(job_id, "P1")
         self.print_sheet(job_id, 1)
-        self.print_side(job_id, "front", 2)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
-        self.srv.post(f"/api/jobs/{job_id}/stop")
-        code, job = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
+        code, job = self.switch(job_id)
         self.assertEqual(code, 200, job)
         self.assertEqual(job["current_sheet"], 2)
 
@@ -458,7 +725,7 @@ class RestartTests(BaseCase):
         self.assertEqual(job["printed_sheets"], 3)
 
         # 重启后不会重复派续单
-        code, _ = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+        code, _ = self.switch(job_id)
         self.assertEqual(code, 409)
 
 
@@ -467,15 +734,17 @@ class ConcurrencyTests(BaseCase):
         job_id = self.finalize(self.make_doc("并发换机", 8))["id"]
         self.start(job_id, "P1")
         self.print_sheet(job_id, 1)
-        self.print_side(job_id, "front", 2)
-        self.srv.post(f"/api/jobs/{job_id}/jam")
-        self.srv.post(f"/api/jobs/{job_id}/stop")
+        self.print_current(job_id, "front")
+        code, _ = self.report_jam(job_id)
+        self.assertEqual(code, 200)
+        code, _ = self.confirm_stop(job_id)
+        self.assertEqual(code, 200)
 
         results = []
         lock = threading.Lock()
 
         def worker():
-            code, body = self.srv.post(f"/api/jobs/{job_id}/switch", {})
+            code, body = self.switch(job_id)
             with lock:
                 results.append((code, body))
 
@@ -515,18 +784,25 @@ class ServiceDirectTests(unittest.TestCase):
             service.add_page(self.db, doc["id"], f"p{i}")
         return service.finalize_document(self.db, doc["id"])["id"]
 
+    def _targets(self, job_id: int):
+        job = service.get_job(self.db, job_id)
+        att = next(r for r in job["records"] if r["status"] == "in_progress")
+        seg = next(s for s in job["segments"] if s["status"] == "active")
+        return seg["id"], att["id"]
+
     def test_jam_idempotent_and_stop_idempotent(self):
         job_id = self._job(4)
         service.start_job(self.db, job_id, "P1")
-        service.print_side(self.db, job_id, "front")
-        service.report_jam(self.db, job_id)
-        service.report_jam(self.db, job_id)  # 重复报告不报错
+        seg_id, att_id = self._targets(job_id)
+        service.print_side(self.db, job_id, "front", att_id)
+        service.report_jam(self.db, job_id, seg_id, att_id)
+        service.report_jam(self.db, job_id, seg_id, att_id)  # 重复报告不报错
         job = service.get_job(self.db, job_id)
         self.assertEqual(job["status"], "jammed")
         self.assertEqual(len([r for r in job["records"] if r["status"] == "scrapped"]), 1)
 
-        service.confirm_stopped(self.db, job_id)
-        service.confirm_stopped(self.db, job_id)
+        service.confirm_stopped(self.db, job_id, seg_id)
+        service.confirm_stopped(self.db, job_id, seg_id)  # 未换机，重复确认仍成功
         job = service.get_job(self.db, job_id)
         self.assertEqual(job["status"], "stopped")
         self.assertEqual(len(job["segments"]), 1)
@@ -534,7 +810,16 @@ class ServiceDirectTests(unittest.TestCase):
     def test_jam_requires_printing(self):
         job_id = self._job(2)
         with self.assertRaises(service.ServiceError):
-            service.report_jam(self.db, job_id)
+            service.report_jam(self.db, job_id, 999, 999)
+
+    def test_stale_attempt_rejected_direct(self):
+        job_id = self._job(4)
+        service.start_job(self.db, job_id, "P1")
+        seg_id, att_id = self._targets(job_id)
+        service.report_jam(self.db, job_id, seg_id, att_id)
+        with self.assertRaises(service.ServiceError) as ctx:
+            service.print_side(self.db, job_id, "front", att_id)
+        self.assertEqual(ctx.exception.code, "stale")
 
 
 if __name__ == "__main__":

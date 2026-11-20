@@ -45,6 +45,14 @@ class ServiceError(Exception):
         self.code = code
 
 
+STALE_MESSAGE = "页面数据已过期，请刷新后重试"
+
+
+def _stale() -> ServiceError:
+    """页面显示的对象已不是当前对象：拒绝写入，提示刷新。"""
+    return ServiceError(STALE_MESSAGE, code="stale")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -89,6 +97,24 @@ def _in_progress_attempt(conn: sqlite3.Connection, job_id: int) -> Optional[sqli
         "ORDER BY id DESC LIMIT 1",
         (job_id,),
     ).fetchone()
+
+
+def _attempt_for_job(conn: sqlite3.Connection, job_id: int, attempt_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM sheet_attempts WHERE id = ?", (attempt_id,)
+    ).fetchone()
+    if row is None or row["job_id"] != job_id:
+        raise ServiceError("出纸记录不存在", status=404, code="not_found")
+    return row
+
+
+def _segment_for_job(conn: sqlite3.Connection, job_id: int, segment_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM print_segments WHERE id = ?", (segment_id,)
+    ).fetchone()
+    if row is None or row["job_id"] != job_id:
+        raise ServiceError("打印段不存在", status=404, code="not_found")
+    return row
 
 
 def _printer_is_free(conn: sqlite3.Connection, printer_id: str) -> bool:
@@ -279,26 +305,26 @@ def print_side(
     db_path: str,
     job_id: int,
     side: str,
-    expected_sheet: Optional[int] = None,
+    attempt_id: int,
 ) -> dict[str, Any]:
-    """逐面打印当前纸张的正面或背面。"""
+    """逐面打印指定的那次出纸。
+
+    attempt_id 必须正是当前正在出纸的那一条记录；页面上的旧记录
+    （已作废、已完整）一律拒绝并提示刷新，绝不落到新纸上。
+    """
     if side not in ("front", "back"):
         raise ServiceError("side 必须是 front 或 back", status=400, code="invalid_side")
     with db.transaction(db_path) as conn:
         job = _get_job(conn, job_id)
+        attempt = _attempt_for_job(conn, job_id, attempt_id)
+        if attempt["status"] != "in_progress":
+            # 那次出纸已作废或已完成，页面已过期。
+            raise _stale()
         if job["status"] != "printing":
             raise ServiceError("作业不在打印中")
         segment = _active_segment(conn, job_id)
-        if segment is None:
-            raise ServiceError("找不到进行中的打印段")
-        attempt = _in_progress_attempt(conn, job_id)
-        if attempt is None:
-            raise ServiceError("当前没有待打印的纸张")
-        if expected_sheet is not None and expected_sheet != attempt["sheet_no"]:
-            raise ServiceError(
-                f"页序已变化，当前应打印第 {attempt['sheet_no']} 张",
-                code="sheet_mismatch",
-            )
+        if segment is None or segment["id"] != attempt["segment_id"]:
+            raise _stale()
 
         ts = now_iso()
         if side == "front":
@@ -336,28 +362,44 @@ def print_side(
         return _serialize_job(conn, _get_job(conn, job_id))
 
 
-def report_jam(db_path: str, job_id: int) -> dict[str, Any]:
-    """报告卡纸：当前半张作废，原机进入待停稳状态，不派续单。"""
+def report_jam(
+    db_path: str,
+    job_id: int,
+    segment_id: int,
+    attempt_id: int,
+) -> dict[str, Any]:
+    """报告卡纸：当前半张作废，原机进入待停稳状态，不派续单。
+
+    只接受页面显示的那一段打印与那一次出纸；同一段重复报告幂等返回，
+    过期页面（段已停稳/已完结，或出纸已换）拒绝并保持原状。
+    """
     with db.transaction(db_path) as conn:
         job = _get_job(conn, job_id)
-        if job["status"] == "jammed":
+        segment = _segment_for_job(conn, job_id, segment_id)
+        if segment["status"] == "jammed":
+            # 同一次卡纸重复报告：直接返回现状。
             return _serialize_job(conn, job)
+        if segment["status"] != "active":
+            raise _stale()
         if job["status"] != "printing":
             raise ServiceError("作业不在打印中，无法报告卡纸")
-        segment = _active_segment(conn, job_id)
-        if segment is None:
-            raise ServiceError("找不到进行中的打印段")
         attempt = _in_progress_attempt(conn, job_id)
+        if (
+            attempt is None
+            or attempt["id"] != attempt_id
+            or attempt["segment_id"] != segment["id"]
+        ):
+            # 页面显示的那次出纸已经不是当前这次，不能误作废新纸。
+            raise _stale()
         ts = now_iso()
-        if attempt is not None:
-            conn.execute(
-                """
-                UPDATE sheet_attempts
-                   SET status = 'scrapped', scrap_reason = '卡纸，半张作废', ended_at = ?
-                 WHERE id = ?
-                """,
-                (ts, attempt["id"]),
-            )
+        conn.execute(
+            """
+            UPDATE sheet_attempts
+               SET status = 'scrapped', scrap_reason = '卡纸，半张作废', ended_at = ?
+             WHERE id = ?
+            """,
+            (ts, attempt["id"]),
+        )
         conn.execute(
             "UPDATE print_segments SET status = 'jammed', ended_at = ?, note = ? WHERE id = ?",
             ("卡纸，等待原机停稳", ts, segment["id"]),
@@ -366,21 +408,29 @@ def report_jam(db_path: str, job_id: int) -> dict[str, Any]:
         return _serialize_job(conn, _get_job(conn, job_id))
 
 
-def confirm_stopped(db_path: str, job_id: int) -> dict[str, Any]:
-    """原机确认停稳；此前完整出纸的纸张保持有效。"""
+def confirm_stopped(db_path: str, job_id: int, segment_id: int) -> dict[str, Any]:
+    """原机确认停稳；此前完整出纸的纸张保持有效。
+
+    只能确认页面里显示的那次卡纸（segment_id）。换机派单前重复确认
+    同一次卡纸幂等成功；已换机或过期的确认请求拒绝并提示刷新。
+    """
     with db.transaction(db_path) as conn:
         job = _get_job(conn, job_id)
-        if job["status"] == "stopped":
+        segment = _segment_for_job(conn, job_id, segment_id)
+        if segment["status"] == "stopped":
+            continued = conn.execute(
+                "SELECT 1 FROM print_segments WHERE continued_from = ? LIMIT 1",
+                (segment["id"],),
+            ).fetchone()
+            if continued is not None:
+                # 那次卡纸已了结并换机，页面已过期。
+                raise _stale()
+            # 还没换机，重复确认同一次卡纸：幂等成功。
             return _serialize_job(conn, job)
+        if segment["status"] != "jammed":
+            raise _stale()
         if job["status"] != "jammed":
-            raise ServiceError("当前没有等待确认停稳的卡纸")
-        segment = conn.execute(
-            "SELECT * FROM print_segments WHERE job_id = ? AND status = 'jammed' "
-            "ORDER BY id DESC LIMIT 1",
-            (job_id,),
-        ).fetchone()
-        if segment is None:
-            raise ServiceError("找不到待停稳的打印段")
+            raise ServiceError("作业状态与打印段不一致")
         ts = now_iso()
         # 只改打印段状态；sheet_attempts 里已完整出纸的记录一律保留。
         conn.execute(

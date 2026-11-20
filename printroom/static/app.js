@@ -79,7 +79,8 @@ async function act(fn, okMessage) {
     if (okMessage) showBanner(okMessage, "ok");
     await refresh();
   } catch (err) {
-    showBanner(err.message);
+    const stale = err.payload && err.payload.code === "stale";
+    showBanner(stale ? `${err.message}（已自动刷新）` : err.message);
     await refresh();
   } finally {
     state.busy = false;
@@ -241,18 +242,22 @@ function renderPrinters() {
         ));
       }
     } else if (printer.state === "printing" && activeJob) {
+      // 按钮只作用于页面当前显示的这次出纸（attempt）与这段打印（segment）：
+      // 点击时把它们的 id 一并提交，服务端核对不一致会拒绝并提示刷新。
+      const attemptId = printer.attempt ? printer.attempt.id : null;
       panel.append(
         el("div", { class: "body", text: `#${printer.job_id} 《${printer.job_title}》 · 第 ${printer.next_sheet}/${printer.total_sheets} 张` }),
         attemptLine(printer.attempt),
         el("div", { class: "actions" },
           el("button", { class: "small", type: "button", text: "出正面",
             disabled: !printer.attempt || printer.attempt.front_printed ? "" : null,
-            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/print`, { side: "front", sheet_no: printer.next_sheet })) }),
+            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/print`, { side: "front", attempt_id: attemptId })) }),
           el("button", { class: "small", type: "button", text: "出背面",
             disabled: !printer.attempt || !printer.attempt.required_back || !printer.attempt.front_printed || printer.attempt.back_printed ? "" : null,
-            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/print`, { side: "back", sheet_no: printer.next_sheet })) }),
+            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/print`, { side: "back", attempt_id: attemptId })) }),
           el("button", { class: "warn small", type: "button", text: "报告卡纸",
-            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/jam`), "已报告卡纸，等待原机停稳") }),
+            disabled: !printer.attempt ? "" : null,
+            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/jam`, { segment_id: printer.segment_id, attempt_id: attemptId }), "已报告卡纸，等待原机停稳") }),
         ),
       );
     } else if (printer.state === "jammed" && activeJob) {
@@ -260,7 +265,7 @@ function renderPrinters() {
         el("div", { class: "body", text: `#${printer.job_id} 《${printer.job_title}》卡纸，半张已作废。` }),
         el("div", { class: "actions" },
           el("button", { class: "danger small", type: "button", text: "确认原机停稳",
-            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/stop`), "已确认停稳，可换机续印") }),
+            onclick: () => act(() => api("POST", `/api/jobs/${printer.job_id}/stop`, { segment_id: printer.segment_id }), "已确认停稳，可换机续印") }),
         ),
       );
     }

@@ -9,7 +9,7 @@ import re
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from . import db, service
@@ -129,7 +129,9 @@ class Handler(BaseHTTPRequestHandler):
         def int_field(name: str) -> int:
             value = data.get(name)
             if isinstance(value, bool) or not isinstance(value, (int, str)):
-                raise service.ServiceError(f"缺少整数参数 {name}", 400, "invalid_field")
+                raise service.ServiceError(
+                    f"缺少整数参数 {name}，请刷新页面后重试", 400, "invalid_field"
+                )
             try:
                 return int(value)
             except ValueError:
@@ -167,24 +169,26 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/jobs/(\d+)/print", path)
         if m:
             side = str(data.get("side") or "")
-            expected = data.get("sheet_no")
-            expected_no: Optional[int] = None
-            if expected is not None:
-                try:
-                    expected_no = int(expected)
-                except (TypeError, ValueError):
-                    raise service.ServiceError("sheet_no 必须是整数", 400, "invalid_field")
-            self._json(service.print_side(dbp, int(m.group(1)), side, expected_no))
+            self._json(
+                service.print_side(dbp, int(m.group(1)), side, int_field("attempt_id"))
+            )
             return
 
         m = re.fullmatch(r"/api/jobs/(\d+)/jam", path)
         if m:
-            self._json(service.report_jam(dbp, int(m.group(1))))
+            self._json(
+                service.report_jam(
+                    dbp,
+                    int(m.group(1)),
+                    int_field("segment_id"),
+                    int_field("attempt_id"),
+                )
+            )
             return
 
         m = re.fullmatch(r"/api/jobs/(\d+)/stop", path)
         if m:
-            self._json(service.confirm_stopped(dbp, int(m.group(1))))
+            self._json(service.confirm_stopped(dbp, int(m.group(1)), int_field("segment_id")))
             return
 
         m = re.fullmatch(r"/api/jobs/(\d+)/switch", path)

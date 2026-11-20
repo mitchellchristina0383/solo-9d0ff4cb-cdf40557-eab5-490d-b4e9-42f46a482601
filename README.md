@@ -38,7 +38,7 @@ python3 -m printroom          # 默认 0.0.0.0:8000，数据库 data/printroom.d
 ## 测试与自检
 
 ```bash
-python3 -m unittest tests.test_printroom -v   # 24 个端到端用例
+python3 -m unittest tests.test_printroom -v   # 34 个端到端用例
 python3 scripts/check_ui.py                   # 静态页面与脚本引用一致性
 python3 scripts/demo.py                       # 跑通“半张卡纸”和“停稳前出纸”两条验收路径
 ```
@@ -57,16 +57,20 @@ python3 scripts/demo.py                       # 跑通“半张卡纸”和“�
 | POST | `/api/documents/{id}/pages/last` | 删除末页 |
 | POST | `/api/documents/{id}/finalize` | 提交入队（幂等） |
 | POST | `/api/jobs/{id}/start` | 开始打印 `{printer_id}` |
-| POST | `/api/jobs/{id}/print` | 出一面 `{side: front\|back, sheet_no?}` |
-| POST | `/api/jobs/{id}/jam` | 报告卡纸（幂等） |
-| POST | `/api/jobs/{id}/stop` | 原机确认停稳（幂等） |
+| POST | `/api/jobs/{id}/print` | 出一面 `{side: front\|back, attempt_id}`，只作用于该次出纸 |
+| POST | `/api/jobs/{id}/jam` | 报告卡纸 `{segment_id, attempt_id}`（同一段重复报告幂等） |
+| POST | `/api/jobs/{id}/stop` | 原机确认停稳 `{segment_id}`（换机前重复确认同一次卡纸幂等） |
 | POST | `/api/jobs/{id}/switch` | 换机派续单 `{printer_id?}`（每个停稳段最多一份） |
 
-错误返回 `{error, code}`，常见 `code`：`printer_busy`、`not_stopped`、`sheet_mismatch`、`empty_document`。
+错误返回 `{error, code}`，常见 `code`：`printer_busy`、`not_stopped`、`stale`、`empty_document`。
+其中 `stale` 表示页面数据已过期：出纸、卡纸、停稳按钮只作用于页面当前显示的那次出纸/那段打印，
+服务端写入前会核对 `attempt_id` / `segment_id`，对不上就拒绝写入并提示刷新，
+出纸记录、作业进度与机台占用均保持原状。
 
 ## 数据一致性
 
 - 写操作走 `BEGIN IMMEDIATE` 事务，`print_segments` 上有“每台打印机最多一个活动/卡纸段”的部分唯一索引。
 - `sheet_attempts(job_id, sheet_no) WHERE status='complete'` 唯一，保证同一张纸不会被计为两次完整出纸。
 - `print_segments.continued_from` 唯一，保证一个停稳段最多派生一份续单；并发重复请求返回同一份。
+- 出纸、卡纸、停稳按 `attempt_id` / `segment_id` 核对操作对象：换机重印同一张纸时，旧页面的点击不会落到新纸上；过期请求返回 `stale`，不产生任何写入。另一台机的无关操作不影响本机按钮。
 - 进度全部落在 SQLite（`data/` 命名卷），服务重启后继续从数据库状态续印。
